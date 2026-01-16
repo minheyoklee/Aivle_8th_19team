@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 
 interface Post {
@@ -29,7 +29,7 @@ export const BoardDetailPage = () => {
 
     const fetchPost = async () => {
         try {
-            const response = await fetch(`http://localhost:3001/api/board/${id}`);
+            const response = await fetch(`/api/v1/board/${id}`);
             if (response.ok) {
                 const data = await response.json();
                 setPost(data);
@@ -47,7 +47,7 @@ export const BoardDetailPage = () => {
         if (!confirm('Are you sure you want to delete this post?')) return;
 
         try {
-            const response = await fetch(`http://localhost:3001/api/board/${id}`, {
+            const response = await fetch(`/api/v1/board/${id}`, {
                 method: 'DELETE',
                 headers: {
                     'Authorization': `Bearer ${token}`

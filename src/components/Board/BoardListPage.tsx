@@ -22,7 +22,7 @@ export const BoardListPage = () => {
 
     const fetchPosts = async () => {
         try {
-            const response = await fetch('http://localhost:3001/api/board');
+            const response = await fetch('/api/v1/board');
             if (response.ok) {
                 const data = await response.json();
                 setPosts(data);

@@ -11,6 +11,8 @@ interface DashboardData {
   originalDeadline: string;
   overallEfficiency: number;
   productionEfficiency: number;
+  historyData?: any[];
+  processStats?: any[];
 }
 
 export function MainDashboard() {
@@ -18,7 +20,7 @@ export function MainDashboard() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch('/api/dashboard/main')
+    fetch('/api/v1/dashboard/main')
       .then(res => res.json())
       .then(setData)
       .finally(() => setLoading(false));
@@ -30,7 +32,6 @@ export function MainDashboard() {
 
   const {
     anomalyData,
-    warningData,
     totalAnomalies,
     totalWarnings,
     totalDelayHours,
@@ -58,20 +59,20 @@ export function MainDashboard() {
 
   const deliveryStatus = getDeliveryStatus();
 
-  const overallData = [
-    { name: '프레스', 정상: 85, 경고: 10, 이상: 5 },
-    { name: '엔진', 정상: 90, 경고: 7, 이상: 3 },
-    { name: '차체', 정상: 78, 경고: 15, 이상: 7 },
-    { name: '도장', 정상: 88, 경고: 8, 이상: 4 },
-    { name: '설비', 정상: 92, 경고: 5, 이상: 3 },
-  ];
-
-  const deliveryRisk = [
+  const deliveryRisk = data.historyData || [
     { 날짜: '1/5', 지연시간: 35 },
     { 날짜: '1/6', 지연시간: 42 },
     { 날짜: '1/7', 지연시간: 58 },
     { 날짜: '1/8', 지연시간: 51 },
     { 날짜: '1/9', 지연시간: totalDelayHours },
+  ];
+
+  const overallData = data.processStats || [
+    { name: '프레스', 정상: 85, 경고: 10, 이상: 5 },
+    { name: '엔진', 정상: 90, 경고: 7, 이상: 3 },
+    { name: '차체', 정상: 78, 경고: 15, 이상: 7 },
+    { name: '도장', 정상: 88, 경고: 8, 이상: 4 },
+    { name: '설비', 정상: 92, 경고: 5, 이상: 3 },
   ];
 
   const processStatus = [

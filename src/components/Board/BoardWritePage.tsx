@@ -24,7 +24,7 @@ export const BoardWritePage = () => {
         }
 
         try {
-            const response = await fetch('http://localhost:3001/api/board', {
+            const response = await fetch('/api/v1/board', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
