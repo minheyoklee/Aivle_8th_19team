@@ -55,6 +55,10 @@ const DEFECT_TYPES = [
 const API_BASE = "http://localhost:8000";
 const DEMO_RANDOM_ON_SAME_VALUE = false;
 
+// ✅ 폴링 주기(여기만 바꾸면 됨)
+const POLL_IMAGE_MS = 5000; // 이미지 예측 요청 주기
+const POLL_VIB_MS = 2000; // 진동 예측 요청 주기
+
 function cn(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
 }
@@ -72,7 +76,7 @@ export function PressMachineDashboard() {
   const [isImageLoading, setIsImageLoading] = useState(false);
   const [imageLastUpdated, setImageLastUpdated] = useState<string>("--:--:--");
 
-  // ✅ 누적 분포(샘플 랜덤 제거)
+  // ✅ 누적 분포
   const [defectAccum, setDefectAccum] = useState<Record<string, number>>(() => {
     const init: Record<string, number> = {};
     DEFECT_TYPES.forEach((k) => (init[k] = 0));
@@ -88,6 +92,10 @@ export function PressMachineDashboard() {
     { time: string; sensor_0: number; sensor_1: number; sensor_2: number }[]
   >([]);
   const [lastUpdated, setLastUpdated] = useState<string>("--:--:--");
+
+  // ✅ 중복 요청(겹침) 방지용
+  const imageInFlightRef = useRef(false);
+  const vibInFlightRef = useRef(false);
 
   const prevRef = useRef<{ err?: number; s0?: number; s1?: number; s2?: number }>(
     {}
@@ -127,6 +135,10 @@ export function PressMachineDashboard() {
   // ✅ Auto Image Predict (폴링)
   // ---------------------------
   const fetchPressImage = async () => {
+    // ✅ 폴링 겹침 방지
+    if (imageInFlightRef.current) return;
+    imageInFlightRef.current = true;
+
     setIsImageLoading(true);
     try {
       const res = await fetch(`${API_BASE}/api/v1/smartfactory/press/image`, {
@@ -145,7 +157,8 @@ export function PressMachineDashboard() {
       setDefectAccum((prev) => {
         const next = { ...prev };
         for (const k of DEFECT_TYPES) {
-          const add = typeof data.all_scores?.[k] === "number" ? data.all_scores[k] : 0;
+          const add =
+            typeof data.all_scores?.[k] === "number" ? data.all_scores[k] : 0;
           next[k] = (next[k] ?? 0) + add;
         }
         return next;
@@ -156,9 +169,11 @@ export function PressMachineDashboard() {
       console.error("Failed to fetch press image:", e);
     } finally {
       setIsImageLoading(false);
+      imageInFlightRef.current = false;
     }
   };
 
+  // ✅ 이미지 자동 폴링 (의존성 [] 고정)
   useEffect(() => {
     let mounted = true;
 
@@ -167,22 +182,27 @@ export function PressMachineDashboard() {
       await fetchPressImage();
     };
 
-    tick();
-    const t = setInterval(tick, 2000);
+    tick(); // 최초 1회
+    const t = window.setInterval(tick, POLL_IMAGE_MS);
+
     return () => {
       mounted = false;
-      clearInterval(t);
+      window.clearInterval(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ---------------------------
-  // ✅ Vibration Monitoring
+  // ✅ Vibration Monitoring (폴링)
   // ---------------------------
   useEffect(() => {
     let mounted = true;
 
     const fetchVibrationData = async () => {
+      // ✅ 폴링 겹침 방지
+      if (vibInFlightRef.current) return;
+      vibInFlightRef.current = true;
+
       try {
         const response = await fetch(
           `${API_BASE}/api/v1/smartfactory/press/vibration`,
@@ -240,14 +260,17 @@ export function PressMachineDashboard() {
         );
       } catch (error) {
         console.error("Failed to fetch vibration data:", error);
+      } finally {
+        vibInFlightRef.current = false;
       }
     };
 
-    fetchVibrationData();
-    const interval = setInterval(fetchVibrationData, 1000);
+    fetchVibrationData(); // 최초 1회
+    const interval = window.setInterval(fetchVibrationData, POLL_VIB_MS);
+
     return () => {
       mounted = false;
-      clearInterval(interval);
+      window.clearInterval(interval);
     };
   }, []);
 
@@ -266,6 +289,9 @@ export function PressMachineDashboard() {
               </h1>
               <p className="text-black text-sm mt-1">
                 프레스 공정 자동 예측(이미지) + 실시간 모니터링(진동)
+              </p>
+              <p className="text-xs text-black/60 mt-1">
+                Polling: image {POLL_IMAGE_MS / 1000}s · vibration {POLL_VIB_MS / 1000}s
               </p>
             </div>
           </div>
@@ -295,7 +321,7 @@ export function PressMachineDashboard() {
 
         {/* Main Grid */}
         <div className="grid grid-cols-12 gap-6">
-          {/* ✅ Image + Result (Welding 스타일) */}
+          {/* ✅ Image + Result */}
           <div className="col-span-12 lg:col-span-6 space-y-6">
             <div className="rounded-2xl border border-black/10 bg-white shadow-sm">
               <div className="px-6 pt-6 pb-4 flex items-center justify-between">
@@ -306,9 +332,12 @@ export function PressMachineDashboard() {
 
                 <button
                   onClick={fetchPressImage}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white hover:bg-black/5 border border-black/15 text-black transition-colors"
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white hover:bg-black/5 border border-black/15 text-black transition-colors disabled:opacity-60"
+                  disabled={isImageLoading}
                 >
-                  <RefreshCw className={cn("w-4 h-4", isImageLoading && "animate-spin")} />
+                  <RefreshCw
+                    className={cn("w-4 h-4", isImageLoading && "animate-spin")}
+                  />
                   새 이미지
                 </button>
               </div>
@@ -333,16 +362,7 @@ export function PressMachineDashboard() {
                       </div>
                     </div>
 
-                    <div className="mt-2 text-xs text-black/70">
-                      source:{" "}
-                      <span className="font-mono text-black">{autoImage?.source ?? "-"}</span>
-                      {autoImage?.sequence ? (
-                        <span className="ml-2">
-                          ({autoImage.sequence.count}장 | next:{" "}
-                          <span className="font-mono">{autoImage.sequence.index_next}</span>)
-                        </span>
-                      ) : null}
-                    </div>
+                    
                     {autoImage?.note ? (
                       <div className="mt-1 text-xs text-black/50">{autoImage.note}</div>
                     ) : null}
@@ -485,9 +505,33 @@ export function PressMachineDashboard() {
                           labelStyle={{ color: "#000" }}
                         />
                         <Legend wrapperStyle={{ color: "#000" }} />
-                        <Line type="monotone" dataKey="sensor_0" stroke="#2563eb" strokeWidth={2} dot={false} name="Sensor 0" isAnimationActive={false} />
-                        <Line type="monotone" dataKey="sensor_1" stroke="#059669" strokeWidth={2} dot={false} name="Sensor 1" isAnimationActive={false} />
-                        <Line type="monotone" dataKey="sensor_2" stroke="#d97706" strokeWidth={2} dot={false} name="Sensor 2" isAnimationActive={false} />
+                        <Line
+                          type="monotone"
+                          dataKey="sensor_0"
+                          stroke="#2563eb"
+                          strokeWidth={2}
+                          dot={false}
+                          name="Sensor 0"
+                          isAnimationActive={false}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="sensor_1"
+                          stroke="#059669"
+                          strokeWidth={2}
+                          dot={false}
+                          name="Sensor 1"
+                          isAnimationActive={false}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="sensor_2"
+                          stroke="#d97706"
+                          strokeWidth={2}
+                          dot={false}
+                          name="Sensor 2"
+                          isAnimationActive={false}
+                        />
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
@@ -516,17 +560,23 @@ export function PressMachineDashboard() {
                           labelStyle={{ color: "#000" }}
                         />
                         <Legend wrapperStyle={{ color: "#000" }} />
-                        <Line type="monotone" dataKey="value" stroke="#7c3aed" strokeWidth={2} dot={false} isAnimationActive={false} />
+                        <Line
+                          type="monotone"
+                          dataKey="value"
+                          stroke="#7c3aed"
+                          strokeWidth={2}
+                          dot={false}
+                          isAnimationActive={false}
+                        />
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
                 </div>
-
               </div>
             </div>
           </div>
 
-          {/* Bottom: Distribution (누적 데이터) */}
+          {/* Bottom: Distribution */}
           <div className="col-span-12">
             <div className="rounded-2xl border border-black/10 bg-white shadow-sm">
               <div className="px-6 pt-6 pb-4 flex items-center justify-between">
@@ -591,7 +641,6 @@ export function PressMachineDashboard() {
               </div>
             </div>
           </div>
-
         </div>
       </div>
     </div>

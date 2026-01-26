@@ -20,6 +20,7 @@ from body_assembly import service as body_service
 # ✅ welding_image는 "본래 welding-image FastAPI 계약"을 그대로 제공하는 모듈로 구성
 from welding_image.pipeline import full_pipeline
 from welding_image.schemas import DefectResponse
+import welding_image
 
 app = FastAPI(title="ML Service API", version="1.0.0")
 
@@ -199,6 +200,35 @@ async def predict_welding_original(file: UploadFile = File(...)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+# ✅ 자동 입력(폴더 순차)
+@app.post("/api/v1/smartfactory/welding/image/auto")
+async def predict_welding_auto():
+    try:
+        # result = {"status","defects","result_image_path", "source","sequence","original_image_path"}
+        result = welding_image.predict_welding_image_auto()
+
+        original_abs = result.get("original_image_path")
+        original_url = to_public_url(original_abs) if original_abs else None
+
+        result_url = None
+        if result.get("result_image_path"):
+            result_url = to_public_url(result["result_image_path"])
+
+        # DefectResponse 스키마 + 추가필드(source/sequence/note)
+        return {
+            "status": result["status"],
+            "defects": result["defects"],
+            "original_image_url": original_url,
+            "result_image_url": result_url,
+            "source": result.get("source"),
+            "sequence": result.get("sequence"),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ✅ 통합 경로(프론트가 쓰는 경로)
 @app.post("/api/v1/smartfactory/welding/image", response_model=DefectResponse)

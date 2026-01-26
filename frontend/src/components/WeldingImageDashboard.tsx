@@ -1,16 +1,5 @@
-import React, { useMemo, useState } from "react";
-import {
-  Camera,
-  Search,
-  Save,
-  RefreshCcw,
-  CheckCircle2,
-  XCircle,
-  AlertTriangle,
-  BarChart3,
-  PieChart as PieIcon,
-} from "lucide-react";
-import { ResponsiveContainer, PieChart, Pie, Cell } from "recharts";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { RefreshCcw, Search } from "lucide-react";
 
 /* =====================
    Types
@@ -22,11 +11,13 @@ type Defect = {
   bbox: number[];
 };
 
-type WeldingResponse = {
+type WeldingAutoResponse = {
   status: "NORMAL" | "DEFECT";
   defects: Defect[];
   original_image_url: string;
   result_image_url: string | null;
+  source?: string;
+  sequence?: { index_next: number; count: number };
 };
 
 type HistoryRow = {
@@ -37,44 +28,19 @@ type HistoryRow = {
   confidencePct: number;
   originalUrl?: string;
   resultUrl?: string;
+  source?: string;
 };
 
 /* =====================
    Constants
 ===================== */
 
-const ENDPOINT = "http://localhost:8000/api/v1/smartfactory/welding/image";
+const ENDPOINT_AUTO =
+  "http://localhost:8000/api/v1/smartfactory/welding/image/auto";
 const SERVER_BASE = "http://localhost:8000";
 
-const DEFECT_META: Record<
-  string,
-  { label: string; dot: string; bar: string; chip: string }
-> = {
-  Spatters: {
-    label: "용접 비산물",
-    dot: "bg-red-500",
-    bar: "bg-red-500",
-    chip: "bg-red-50 text-red-700 border-red-200",
-  },
-  Crack: {
-    label: "균열",
-    dot: "bg-orange-500",
-    bar: "bg-orange-500",
-    chip: "bg-orange-50 text-orange-700 border-orange-200",
-  },
-  Porosity: {
-    label: "기공",
-    dot: "bg-amber-500",
-    bar: "bg-amber-500",
-    chip: "bg-amber-50 text-amber-800 border-amber-200",
-  },
-  Excess_Reinforcement: {
-    label: "과다 보강",
-    dot: "bg-indigo-500",
-    bar: "bg-indigo-500",
-    chip: "bg-indigo-50 text-indigo-700 border-indigo-200",
-  },
-};
+// 폴링 주기(밀리초). 5000 = 5초
+const POLL_MS = 5000;
 
 /* =====================
    Utils
@@ -112,19 +78,14 @@ function publicUrl(path?: string | null) {
 
 function Card({
   title,
-  icon,
   children,
 }: {
   title: string;
-  icon?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
     <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
-      <div className="flex items-center gap-2 mb-5">
-        {icon}
-        <div className="font-extrabold text-gray-900">{title}</div>
-      </div>
+      <div className="font-extrabold text-gray-900 mb-5">{title}</div>
       {children}
     </div>
   );
@@ -133,12 +94,10 @@ function Card({
 function Stat({
   label,
   value,
-  sub,
   tone = "default",
 }: {
   label: string;
   value: string;
-  sub?: string;
   tone?: "default" | "good" | "bad" | "info";
 }) {
   const toneClass =
@@ -153,10 +112,7 @@ function Stat({
   return (
     <div className="rounded-2xl border border-gray-200 bg-white shadow-sm p-4">
       <div className="text-xs text-gray-500">{label}</div>
-      <div className={`mt-1 text-2xl font-extrabold ${toneClass}`}>
-        {value}
-      </div>
-      {sub && <div className="mt-1 text-xs text-gray-500">{sub}</div>}
+      <div className={`mt-1 text-2xl font-extrabold ${toneClass}`}>{value}</div>
     </div>
   );
 }
@@ -166,13 +122,17 @@ function Stat({
 ===================== */
 
 export function WeldingImageDashboard() {
-  const [file, setFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState("");
-  const [result, setResult] = useState<WeldingResponse | null>(null);
+  const [result, setResult] = useState<WeldingAutoResponse | null>(null);
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(false);
-  const [seq, setSeq] = useState(1);
   const [error, setError] = useState("");
+  const [lastUpdated, setLastUpdated] = useState("--:--:--");
+
+  // ✅ seq는 useRef로 (리렌더/의존성 꼬임 방지)
+  const seqRef = useRef(1);
+
+  // ✅ 폴링 중 중복 호출 방지용
+  const inFlightRef = useRef(false);
 
   const latest = history[0];
   const latestDefect =
@@ -183,70 +143,87 @@ export function WeldingImageDashboard() {
   const good = total - bad;
   const rate = total === 0 ? 100 : (good / total) * 100;
 
-  const donutData = [
-    { name: "양품", value: good },
-    { name: "불량", value: bad },
-  ];
+  const mainImage = useMemo(() => {
+    if (result?.result_image_url) return publicUrl(result.result_image_url);
+    if (result?.original_image_url) return publicUrl(result.original_image_url);
+    return "";
+  }, [result]);
 
-  /* ------------------ handlers ------------------ */
+  const fetchAuto = async () => {
+    // ✅ 이미 요청 중이면 스킵 (폴링 겹침 방지)
+    if (inFlightRef.current) return;
 
-  const resetAll = () => {
-    setFile(null);
-    setPreview("");
-    setResult(null);
-    setError("");
-  };
-
-  const onPickFile = (f: File | null) => {
-    setFile(f);
-    setResult(null);
-    setError("");
-    if (f) setPreview(URL.createObjectURL(f));
-  };
-
-  const onSubmit = async () => {
-    if (!file) return;
+    inFlightRef.current = true;
     setLoading(true);
 
     try {
-      const form = new FormData();
-      form.append("file", file);
+      const res = await fetch(ENDPOINT_AUTO, { method: "POST" });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        throw new Error(`API ${res.status}: ${t || res.statusText}`);
+      }
 
-      const res = await fetch(ENDPOINT, { method: "POST", body: form });
-      const json = (await res.json()) as WeldingResponse;
+      const json = (await res.json()) as WeldingAutoResponse;
 
       setResult(json);
+      setLastUpdated(nowHHMMSS());
+      setError("");
 
       const top = json.status === "DEFECT" ? topDefect(json.defects) : null;
 
+      const id = `IMG-${pad5(seqRef.current)}`;
+      seqRef.current += 1;
+
       setHistory((prev) => [
         {
-          id: `IMG-${pad5(seq)}`,
+          id,
           time: nowHHMMSS(),
           judgement: json.status === "DEFECT" ? "불량" : "양품",
           defectType: top?.class ?? "-",
           confidencePct: top ? confidenceToPct(top.confidence) : 99,
           originalUrl: publicUrl(json.original_image_url),
           resultUrl: publicUrl(json.result_image_url),
+          source: json.source,
         },
         ...prev,
       ]);
-
-      setSeq((p) => p + 1);
-    } catch {
-      setError("분석 중 오류 발생");
+    } catch (e: any) {
+      setError(e?.message || "자동 분석 중 오류 발생");
     } finally {
       setLoading(false);
+      inFlightRef.current = false;
     }
   };
 
-  const mainImage = useMemo(() => {
-    if (result?.result_image_url) return publicUrl(result.result_image_url);
-    if (result?.original_image_url) return publicUrl(result.original_image_url);
-    return preview;
-  }, [result, preview]);
+  // ✅ 자동 폴링: 의존성 [] 로 고정 (1초 폭주 해결)
+  useEffect(() => {
+    let mounted = true;
 
-  /* ===================== JSX ===================== */
+    const tick = async () => {
+      if (!mounted) return;
+      await fetchAuto();
+    };
+
+    // 최초 1회 즉시 실행
+    tick();
+
+    // 이후 POLL_MS 간격으로
+    const t = window.setInterval(tick, POLL_MS);
+
+    return () => {
+      mounted = false;
+      window.clearInterval(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const resetAll = () => {
+    setResult(null);
+    setHistory([]);
+    seqRef.current = 1;
+    setError("");
+    setLastUpdated("--:--:--");
+  };
 
   return (
     <div className="min-h-screen bg-gray-50 p-8">
@@ -254,20 +231,36 @@ export function WeldingImageDashboard() {
       <div className="mb-6 flex justify-between items-start">
         <div>
           <div className="text-3xl font-extrabold text-gray-900">
-            용접 이미지 검사
+            용접 이미지 검사 (자동)
           </div>
-          <div className="text-sm text-gray-600 mt-1">
-            AI 비전 기반 공정 후 불량 판정
+          <div className="text-xs text-gray-500 mt-1">
+            Last update: <span className="font-mono">{lastUpdated}</span>
+          </div>
+          <div className="text-xs text-gray-400 mt-1">
+            Polling: {POLL_MS / 1000}s
           </div>
         </div>
 
-        <button
-          onClick={resetAll}
-          className="px-5 py-3 rounded-xl font-bold text-white bg-blue-600 hover:bg-blue-700 shadow inline-flex items-center gap-2"
-        >
-          <RefreshCcw className="w-5 h-5" />
-          새 이미지
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={fetchAuto}
+            className="px-5 py-3 rounded-xl font-bold text-black bg-yellow-300 hover:bg-yellow-400 shadow inline-flex items-center gap-2 disabled:opacity-60"
+            disabled={loading}
+          >
+            <span className="w-7 h-7 bg-yellow-400 rounded-md flex items-center justify-center">
+              <Search className="w-4 h-4 text-black" />
+            </span>
+            즉시 분석
+          </button>
+
+          <button
+            onClick={resetAll}
+            className="px-5 py-3 rounded-xl font-bold text-white bg-blue-600 hover:bg-blue-700 shadow inline-flex items-center gap-2"
+          >
+            <RefreshCcw className="w-5 h-5" />
+            초기화
+          </button>
+        </div>
       </div>
 
       {/* KPI */}
@@ -284,24 +277,10 @@ export function WeldingImageDashboard() {
         </div>
       )}
 
-      {/* Main */}
+      {/* Main (좌 이미지 / 우 결과) */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
         {/* Image */}
         <Card title="이미지 분석">
-          <div className="flex justify-between mb-4">
-            <input type="file" onChange={(e) => onPickFile(e.target.files?.[0] ?? null)} />
-            <button
-              onClick={onSubmit}
-              disabled={loading}
-              className="px-4 py-2 rounded-xl bg-yellow-300 font-bold inline-flex items-center gap-2"
-            >
-              <span className="w-7 h-7 bg-yellow-400 rounded-md flex items-center justify-center">
-                <Search className="w-4 h-4 text-black" />
-              </span>
-              분석
-            </button>
-          </div>
-
           <div className="bg-gray-900 rounded-xl p-3">
             {mainImage ? (
               <img src={mainImage} className="w-full h-64 object-contain" />
@@ -312,8 +291,8 @@ export function WeldingImageDashboard() {
             )}
           </div>
 
-          <div className="mt-4 flex justify-between">
-            <div className="text-xs text-gray-500 mb-1">최근 결과</div>
+          <div className="mt-4 flex justify-between items-center">
+            <div className="text-xs text-gray-500">최근 결과</div>
             {latest ? (
               latest.judgement === "양품" ? (
                 <span className="px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 border font-semibold">
@@ -354,6 +333,26 @@ export function WeldingImageDashboard() {
               </div>
             </div>
           </div>
+
+          {result?.status === "DEFECT" && result.defects.length > 0 && (
+            <div className="mt-4 border rounded-xl p-3">
+              <div className="text-xs text-gray-500 mb-2">검출 목록</div>
+              <div className="space-y-1 text-sm">
+                {result.defects
+                  .slice()
+                  .sort((a, b) => b.confidence - a.confidence)
+                  .slice(0, 6)
+                  .map((d, i) => (
+                    <div key={`${d.class}-${i}`} className="flex justify-between">
+                      <span>{d.class}</span>
+                      <span className="font-mono">
+                        {confidenceToPct(d.confidence)}%
+                      </span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
         </Card>
       </div>
 
@@ -375,7 +374,7 @@ export function WeldingImageDashboard() {
             <tbody>
               {history.map((h) => (
                 <tr key={h.id} className="border-b">
-                  <td>{h.id}</td>
+                  <td className="py-2">{h.id}</td>
                   <td>{h.time}</td>
                   <td>{h.judgement}</td>
                   <td>{h.defectType}</td>
