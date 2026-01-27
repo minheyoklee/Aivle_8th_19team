@@ -391,5 +391,66 @@ async def body_inspect_batch(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     
+# main.py (아래쪽 body endpoint들 근처에 추가)
+
+@app.post("/api/v1/smartfactory/body/inspect/auto")
+async def body_inspect_auto(
+    part: str = Form(...),
+    conf: float = Form(0.25),
+):
+    """
+    samples 폴더에서 part 이미지를 자동으로 하나 꺼내서 검사
+    """
+    try:
+        pred = body_service.predict_part_auto(part.strip().lower(), BASE_DIR, conf=float(conf))
+        out_path = body_service.save_annotated_image(pred["annotated_bgr"], BASE_DIR, filename_prefix=part)
+
+        original_abs = pred.get("original_image_path")
+        return {
+            "part": pred["part"],
+            "pass_fail": pred["pass_fail"],
+            "detections": pred["detections"],
+            "original_image_url": to_public_url(original_abs) if original_abs else None,
+            "result_image_url": to_public_url(out_path),
+            "source": pred.get("source"),
+            "sequence": pred.get("sequence"),
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/smartfactory/body/inspect/batch/auto")
+async def body_inspect_batch_auto(
+    conf: float = Form(0.25),
+):
+    """
+    5개 파트 모두 samples에서 자동으로 하나씩 꺼내서 배치 검사
+    """
+    try:
+        results = {}
+        for part in ["door", "bumper", "headlamp", "taillamp", "radiator"]:
+            try:
+                pred = body_service.predict_part_auto(part, BASE_DIR, conf=float(conf))
+                out_path = body_service.save_annotated_image(pred["annotated_bgr"], BASE_DIR, filename_prefix=part)
+
+                original_abs = pred.get("original_image_path")
+                results[part] = {
+                    "part": pred["part"],
+                    "pass_fail": pred["pass_fail"],
+                    "detections": pred["detections"],
+                    "original_image_url": to_public_url(original_abs) if original_abs else None,
+                    "result_image_url": to_public_url(out_path),
+                    "source": pred.get("source"),
+                    "sequence": pred.get("sequence"),
+                }
+            except Exception as inner:
+                results[part] = {"error": str(inner)}
+
+        return {"results": results}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

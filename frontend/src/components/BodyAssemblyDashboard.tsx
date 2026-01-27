@@ -1,11 +1,12 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Upload,
-  RefreshCcw,
+  Car,
+  Layers,
+  RefreshCw,
+  AlertTriangle,
   CheckCircle2,
   XCircle,
-  AlertTriangle,
-  Car,
+  RotateCcw,
 } from "lucide-react";
 
 type PartKey = "door" | "bumper" | "headlamp" | "taillamp" | "radiator";
@@ -14,59 +15,77 @@ type Detection = {
   cls: number;
   name: string;
   conf: number;
-  bbox: [number, number, number, number]; // [x1,y1,x2,y2]
+  bbox: [number, number, number, number];
 };
 
 type BodyResult = {
   part: PartKey;
   pass_fail: "PASS" | "FAIL";
   detections: Detection[];
-  original_image_url: string;
-  result_image_url: string;
+  original_image_url?: string | null;
+  result_image_url?: string | null;
   error?: string;
+
+  source?: string;
+  sequence?: { index_next: number; count: number };
 };
 
 type BatchResponse = {
-  results: Record<PartKey, BodyResult | null>;
+  results: Record<PartKey, BodyResult | null | any>;
 };
 
 const API_BASE = "http://localhost:8000";
 
-const PARTS: { key: PartKey; label: string; hint: string }[] = [
-  { key: "door", label: "도어", hint: "도어 이미지 업로드" },
-  { key: "bumper", label: "범퍼", hint: "범퍼 이미지 업로드" },
-  { key: "headlamp", label: "헤드램프", hint: "헤드램프 이미지 업로드" },
-  { key: "taillamp", label: "테일램프", hint: "테일램프 이미지 업로드" },
-  { key: "radiator", label: "라디에이터", hint: "라디에이터 이미지 업로드" },
+// ✅ 프레스처럼 5초 폴링
+const POLL_MS = 5000;
+
+const PARTS: { key: PartKey; label: string }[] = [
+  { key: "door", label: "도어" },
+  { key: "bumper", label: "범퍼" },
+  { key: "headlamp", label: "헤드램프" },
+  { key: "taillamp", label: "테일램프" },
+  { key: "radiator", label: "라디에이터" },
 ];
 
-function joinUrl(path?: string) {
+function cn(...classes: Array<string | false | null | undefined>) {
+  return classes.filter(Boolean).join(" ");
+}
+
+function joinUrl(path?: string | null) {
   if (!path) return "";
-  // FastAPI가 /static/... 으로 주면 API_BASE 붙여서 접근
   if (path.startsWith("http://") || path.startsWith("https://")) return path;
   return `${API_BASE}${path}`;
 }
 
-function PassFailBadge({ value }: { value: "PASS" | "FAIL" }) {
+function nowHHMMSS() {
+  const now = new Date();
+  return `${now.getHours()}:${String(now.getMinutes()).padStart(2, "0")}:${String(
+    now.getSeconds()
+  ).padStart(2, "0")}`;
+}
+
+function Badge({ value }: { value: "PASS" | "FAIL" }) {
   const isPass = value === "PASS";
   return (
     <span
-      className={[
-        "inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs font-semibold",
+      className={cn(
+        "inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs font-semibold border",
         isPass
-          ? "bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30"
-          : "bg-rose-500/15 text-rose-400 ring-1 ring-rose-500/30",
-      ].join(" ")}
+          ? "bg-emerald-50 border-emerald-200 text-black"
+          : "bg-red-50 border-red-200 text-black"
+      )}
     >
-      {isPass ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+      {isPass ? (
+        <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+      ) : (
+        <XCircle className="w-4 h-4 text-red-600" />
+      )}
       {value}
     </span>
   );
 }
 
 export function BodyAssemblyDashboard() {
-  const [files, setFiles] = useState<Partial<Record<PartKey, File>>>({});
-  const [previews, setPreviews] = useState<Partial<Record<PartKey, string>>>({});
   const [conf, setConf] = useState<number>(0.25);
 
   const [loading, setLoading] = useState(false);
@@ -75,277 +94,318 @@ export function BodyAssemblyDashboard() {
   const [results, setResults] = useState<Partial<Record<PartKey, BodyResult | null>>>(
     {}
   );
+  const [lastUpdated, setLastUpdated] = useState<string>("--:--:--");
 
-  const canAnalyze = useMemo(() => {
-    return PARTS.some((p) => !!files[p.key]);
-  }, [files]);
+  // 겹침 방지
+  const inFlightRef = useRef(false);
 
-  const handlePick = (part: PartKey, file?: File) => {
-    if (!file) return;
-
-    setFiles((prev) => ({ ...prev, [part]: file }));
-    const url = URL.createObjectURL(file);
-    setPreviews((prev) => ({ ...prev, [part]: url }));
-
-    // 업로드 이후 이전 결과는 초기화(해당 파트만)
-    setResults((prev) => ({ ...prev, [part]: undefined }));
-  };
+  const stats = useMemo(() => {
+    const vals = Object.values(results).filter(Boolean) as BodyResult[];
+    const inspected = vals.length;
+    const fails = vals.filter((r) => r.pass_fail === "FAIL").length;
+    const passes = vals.filter((r) => r.pass_fail === "PASS").length;
+    const dets = vals.reduce((acc, r) => acc + (r.detections?.length ?? 0), 0);
+    return { inspected, passes, fails, dets };
+  }, [results]);
 
   const resetAll = () => {
-    setFiles({});
     setResults({});
     setError(null);
-
-    // preview revoke
-    Object.values(previews).forEach((u) => u && URL.revokeObjectURL(u));
-    setPreviews({});
+    setLastUpdated("--:--:--");
   };
 
-  const analyzeBatch = async () => {
+  const fetchAutoBatch = async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+
     setLoading(true);
     setError(null);
 
     try {
       const fd = new FormData();
-      // FastAPI batch endpoint 인자명과 동일하게 맞춤
-      if (files.door) fd.append("door_file", files.door);
-      if (files.bumper) fd.append("bumper_file", files.bumper);
-      if (files.headlamp) fd.append("headlamp_file", files.headlamp);
-      if (files.taillamp) fd.append("taillamp_file", files.taillamp);
-      if (files.radiator) fd.append("radiator_file", files.radiator);
-
       fd.append("conf", String(conf));
 
-      const res = await fetch(`${API_BASE}/api/v1/smartfactory/body/inspect/batch`, {
+      const res = await fetch(`${API_BASE}/api/v1/smartfactory/body/inspect/batch/auto`, {
         method: "POST",
         body: fd,
       });
 
       if (!res.ok) {
-        const t = await res.text();
-        throw new Error(t || `HTTP ${res.status}`);
+        const t = await res.text().catch(() => "");
+        throw new Error(`API ${res.status}: ${t || res.statusText}`);
       }
 
       const data: BatchResponse = await res.json();
-      setResults(data.results ?? {});
+      setResults((data.results ?? {}) as any);
+      setLastUpdated(nowHHMMSS());
     } catch (e: any) {
-      setError(e?.message ?? "분석 중 오류가 발생했습니다.");
+      setError(e?.message ?? "자동 배치 분석 중 오류가 발생했습니다.");
     } finally {
       setLoading(false);
+      inFlightRef.current = false;
     }
   };
 
+  // ✅ 5초 폴링 (프레스처럼)
+  useEffect(() => {
+    let mounted = true;
+
+    const tick = async () => {
+      if (!mounted) return;
+      await fetchAutoBatch();
+    };
+
+    tick(); // 최초 1회
+    const t = window.setInterval(tick, POLL_MS);
+
+    return () => {
+      mounted = false;
+      window.clearInterval(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conf]); // conf 바꾸면 새 주기로 다시 시작(원하면 []로 고정 가능)
+
   return (
-    <div className="min-h-screen bg-[#0b1020] text-black">
-      <div className="mx-auto max-w-6xl px-6 py-6">
-        {/* Header */}
-        <div className="flex flex-col gap-3 rounded-2xl bg-white/5 p-5 ring-1 ring-white/10">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <div className="grid h-10 w-10 place-items-center rounded-xl bg-white/10 ring-1 ring-white/10">
-                <Car size={18} />
-              </div>
-              <div>
-                <div className="text-lg font-semibold">차체 조립 검사</div>
-                <div className="text-sm text-white/60">
-                  부품별 이미지 업로드 후 배치 분석(PASS/FAIL + 결함 위치)
-                </div>
-              </div>
+    <div className="min-h-screen bg-white text-black">
+      <div className="p-8">
+        {/* Header (프레스 스타일) */}
+        <div className="flex items-center justify-between mb-8 border-b border-black/10 pb-5">
+          <div className="flex items-center gap-4">
+            <div className="p-3 bg-blue-600 rounded-2xl shadow-lg shadow-blue-500/20">
+              <Car className="w-7 h-7 text-white" />
             </div>
-
-            <div className="flex items-center gap-2">
-              <button
-                onClick={resetAll}
-                className="inline-flex items-center gap-2 rounded-xl bg-white/10 px-3 py-2 text-sm font-medium ring-1 ring-white/10 hover:bg-white/15"
-              >
-                <RefreshCcw size={16} />
-                초기화
-              </button>
-
-              <button
-                disabled={!canAnalyze || loading}
-                onClick={analyzeBatch}
-                className={[
-                  "inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold",
-                  !canAnalyze || loading
-                    ? "bg-white/10 text-white/40 ring-1 ring-white/10 cursor-not-allowed"
-                    : "bg-blue-500/20 text-blue-200 ring-1 ring-blue-500/30 hover:bg-blue-500/25",
-                ].join(" ")}
-              >
-                <Upload size={16} />
-                {loading ? "분석 중..." : "배치 분석"}
-              </button>
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight text-black">
+                차체 조립 검사 대시보드
+              </h1>
+              <p className="text-black text-sm mt-1">
+                샘플 이미지 자동 투입(배치) · 5초마다 PASS/FAIL + 결함 위치 표시
+              </p>
+              <p className="text-xs text-black/60 mt-1">
+                Polling: {POLL_MS / 1000}s · last update{" "}
+                <span className="font-mono">{lastUpdated}</span>
+              </p>
             </div>
           </div>
 
-          {/* controls */}
-          <div className="flex flex-wrap items-center gap-3 pt-1">
-            <div className="flex items-center gap-2 rounded-xl bg-white/5 px-3 py-2 ring-1 ring-white/10">
-              <span className="text-xs text-white/70">Confidence</span>
-              <input
-                type="number"
-                step={0.01}
-                min={0}
-                max={1}
-                value={conf}
-                onChange={(e) => setConf(parseFloat(e.target.value || "0.25"))}
-                className="w-20 rounded-lg bg-black/20 px-2 py-1 text-sm ring-1 ring-white/10 outline-none"
-              />
-              <span className="text-xs text-white/50">(0~1)</span>
+          <div className="flex items-center gap-3 text-sm">
+            <div className="px-3 py-2 rounded-xl bg-white border border-black/15 text-black">
+              상태:{" "}
+              <span className={cn("font-semibold", loading ? "text-amber-700" : "text-emerald-700")}>
+                {loading ? "요청 중" : "수신 대기/완료"}
+              </span>
             </div>
 
-            {error && (
-              <div className="inline-flex items-center gap-2 rounded-xl bg-rose-500/10 px-3 py-2 text-sm text-rose-200 ring-1 ring-rose-500/20">
-                <AlertTriangle size={16} />
-                {error}
-              </div>
-            )}
+            <div className="px-3 py-2 rounded-xl bg-white border border-black/15 text-black">
+              FAIL <span className="font-semibold text-red-600">{stats.fails}</span> · PASS{" "}
+              <span className="font-semibold text-emerald-700">{stats.passes}</span>
+            </div>
+
+            <button
+              onClick={fetchAutoBatch}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-white hover:bg-black/5 border border-black/15 text-black transition-colors"
+            >
+              <RefreshCw className="w-4 h-4" />
+              즉시 갱신
+            </button>
+
+            <button
+              onClick={resetAll}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-white hover:bg-black/5 border border-black/15 text-black transition-colors"
+            >
+              <RotateCcw className="w-4 h-4" />
+              화면 초기화
+            </button>
           </div>
+        </div>
+
+        {/* Controls */}
+        <div className="mb-6 flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2 rounded-xl bg-white border border-black/15 px-3 py-2">
+            <span className="text-xs text-black/70">Confidence</span>
+            <input
+              type="number"
+              step={0.01}
+              min={0}
+              max={1}
+              value={conf}
+              onChange={(e) => setConf(parseFloat(e.target.value || "0.25"))}
+              className="w-24 rounded-lg bg-white px-2 py-1 text-sm border border-black/15 outline-none"
+            />
+            <span className="text-xs text-black/50">(0~1)</span>
+          </div>
+
+          <div className="rounded-xl bg-white border border-black/15 px-3 py-2 text-xs text-black/70">
+            검사됨 <span className="font-semibold text-black">{stats.inspected}</span> · 총 탐지{" "}
+            <span className="font-semibold text-black">{stats.dets}</span>
+          </div>
+
+          {error && (
+            <div className="inline-flex items-center gap-2 rounded-xl bg-red-50 px-3 py-2 text-sm text-black border border-red-200">
+              <AlertTriangle className="w-4 h-4 text-red-600" />
+              {error}
+            </div>
+          )}
         </div>
 
         {/* Grid */}
-        <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
-          {PARTS.map((p) => {
-            const r = results[p.key];
-            const hasResult = !!r && (r as BodyResult).pass_fail;
-            const previewUrl = previews[p.key];
+        <div className="grid grid-cols-12 gap-6">
+          {/* Parts */}
+          <div className="col-span-12">
+            <div className="rounded-2xl border border-black/10 bg-white shadow-sm">
+              <div className="px-6 pt-6 pb-4 flex items-center justify-between">
+                <h3 className="font-semibold flex items-center gap-2 text-black">
+                  <Layers className="w-4 h-4 text-blue-600" />
+                  부품별 검사 결과 (Auto Batch)
+                </h3>
+                <span className="text-xs px-2 py-1 rounded-lg bg-white border border-black/10 text-black">
+                  Live
+                </span>
+              </div>
 
-            return (
-              <div
-                key={p.key}
-                className="rounded-2xl bg-white/5 p-4 ring-1 ring-white/10"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className="text-base font-semibold">{p.label}</div>
-                    <div className="text-xs text-white/60">{p.hint}</div>
-                  </div>
+              <div className="px-6 pb-6">
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {PARTS.map((p) => {
+                    const r = results[p.key] as BodyResult | null | undefined;
 
-                  {hasResult && r && !r.error && (
-                    <PassFailBadge value={r.pass_fail} />
-                  )}
-                  {r?.error && (
-                    <span className="inline-flex items-center gap-1 rounded-full bg-rose-500/15 px-2 py-1 text-xs font-semibold text-rose-200 ring-1 ring-rose-500/20">
-                      <AlertTriangle size={14} />
-                      ERROR
-                    </span>
-                  )}
+                    return (
+                      <div key={p.key} className="rounded-2xl border border-black/10 bg-white shadow-sm">
+                        <div className="px-5 pt-5 pb-4 flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-base font-semibold text-black">{p.label}</div>
+                            <div className="text-xs text-black/60">
+                              샘플 폴더에서 자동 입력 → PASS/FAIL 판정
+                            </div>
+                          </div>
+
+                          {r?.pass_fail && !r.error && <Badge value={r.pass_fail} />}
+                          {r?.error && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-1 text-xs font-semibold text-black border border-red-200">
+                              <AlertTriangle className="w-4 h-4 text-red-600" />
+                              ERROR
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="px-5 pb-5">
+                          {/* images */}
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div className="rounded-2xl border border-black/10 bg-white overflow-hidden">
+                              <div className="px-3 py-2 text-xs text-black/70 border-b border-black/10">
+                                원본
+                              </div>
+                              {r?.original_image_url ? (
+                                <img
+                                  src={joinUrl(r.original_image_url)}
+                                  alt={`${p.key}-original`}
+                                  className="w-full h-44 object-contain bg-white"
+                                />
+                              ) : (
+                                <div className="h-44 grid place-items-center text-sm text-black/50">
+                                  아직 수신 전
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="rounded-2xl border border-black/10 bg-white overflow-hidden">
+                              <div className="px-3 py-2 text-xs text-black/70 border-b border-black/10">
+                                결과(Annot)
+                              </div>
+                              {r?.result_image_url ? (
+                                <img
+                                  src={joinUrl(r.result_image_url)}
+                                  alt={`${p.key}-result`}
+                                  className="w-full h-44 object-contain bg-white"
+                                />
+                              ) : (
+                                <div className="h-44 grid place-items-center text-sm text-black/50">
+                                  아직 수신 전
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* detections */}
+                          <div className="mt-4 rounded-2xl border border-black/10 bg-white">
+                            <div className="px-4 py-3 flex items-center justify-between border-b border-black/10">
+                              <div className="text-sm font-semibold text-black">탐지 결과</div>
+                              {r?.detections && !r.error && (
+                                <div className="text-xs text-black/60">
+                                  detections:{" "}
+                                  <span className="font-semibold text-black">
+                                    {r.detections.length}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="p-4">
+                              {!r ? (
+                                <div className="text-sm text-black/60">데이터 수신 대기 중...</div>
+                              ) : r.error ? (
+                                <div className="text-sm text-red-600">{r.error}</div>
+                              ) : (r.detections?.length ?? 0) === 0 ? (
+                                <div className="text-sm text-emerald-700">
+                                  결함 탐지 없음 (PASS)
+                                </div>
+                              ) : (
+                                <div className="overflow-x-auto">
+                                  <table className="w-full text-left text-sm">
+                                    <thead className="text-xs text-black/60">
+                                      <tr>
+                                        <th className="py-2">Class</th>
+                                        <th className="py-2">Conf</th>
+                                        <th className="py-2">BBox</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody className="text-black">
+                                      {r.detections.map((d, idx) => (
+                                        <tr key={idx} className="border-t border-black/10">
+                                          <td className="py-2">
+                                            <div className="font-semibold">{d.name}</div>
+                                            <div className="text-xs text-black/50">#{d.cls}</div>
+                                          </td>
+                                          <td className="py-2 font-mono">{d.conf}</td>
+                                          <td className="py-2 text-xs text-black/70 font-mono">
+                                            [{d.bbox.join(", ")}]
+                                          </td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              )}
+
+                              {/* auto debug */}
+                              {r?.source && (
+                                <div className="mt-3 text-xs text-black/50">
+                                  source: <span className="text-black/70">{r.source}</span>
+                                  {r.sequence && (
+                                    <span className="ml-2 text-black/50">
+                                      (next: {r.sequence.index_next} / {r.sequence.count})
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
 
-                {/* uploader */}
-                <div className="mt-3 flex flex-col gap-3">
-                  <label className="group flex cursor-pointer items-center justify-between rounded-xl bg-black/20 px-3 py-2 ring-1 ring-white/10 hover:bg-black/25">
-                    <div className="flex items-center gap-2 text-sm text-white/80">
-                      <Upload size={16} className="text-white/60 group-hover:text-white/80" />
-                      <span>
-                        {files[p.key]?.name ?? "파일 선택"}
-                      </span>
-                    </div>
-                    <span className="text-xs text-white/40">JPG/PNG/WEBP</span>
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={(e) => handlePick(p.key, e.target.files?.[0])}
-                    />
-                  </label>
-
-                  {/* images */}
-                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                    <div className="rounded-xl bg-black/20 p-2 ring-1 ring-white/10">
-                      <div className="mb-2 text-xs text-white/60">업로드 미리보기</div>
-                      {previewUrl ? (
-                        <img
-                          src={previewUrl}
-                          alt={`${p.key}-preview`}
-                          className="h-48 w-full rounded-lg object-contain"
-                        />
-                      ) : (
-                        <div className="grid h-48 place-items-center rounded-lg border border-dashed border-white/10 text-sm text-white/40">
-                          이미지 없음
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="rounded-xl bg-black/20 p-2 ring-1 ring-white/10">
-                      <div className="mb-2 text-xs text-white/60">결과 이미지(Annot)</div>
-                      {r?.result_image_url ? (
-                        <img
-                          src={joinUrl(r.result_image_url)}
-                          alt={`${p.key}-result`}
-                          className="h-48 w-full rounded-lg object-contain"
-                        />
-                      ) : (
-                        <div className="grid h-48 place-items-center rounded-lg border border-dashed border-white/10 text-sm text-white/40">
-                          분석 결과 없음
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* detections */}
-                  <div className="rounded-xl bg-black/20 p-3 ring-1 ring-white/10">
-                    <div className="mb-2 flex items-center justify-between">
-                      <div className="text-sm font-semibold">탐지 결과</div>
-                      {r?.pass_fail && !r.error && (
-                        <div className="text-xs text-white/60">
-                          detections: <span className="font-semibold text-white">{r.detections?.length ?? 0}</span>
-                        </div>
-                      )}
-                    </div>
-
-                    {!r ? (
-                      <div className="text-sm text-white/50">아직 분석하지 않았습니다.</div>
-                    ) : r.error ? (
-                      <div className="text-sm text-rose-200">{r.error}</div>
-                    ) : (r.detections?.length ?? 0) === 0 ? (
-                      <div className="text-sm text-emerald-200">결함 탐지 없음 (PASS)</div>
-                    ) : (
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-left text-sm">
-                          <thead className="text-xs text-white/60">
-                            <tr>
-                              <th className="py-2">Class</th>
-                              <th className="py-2">Conf</th>
-                              <th className="py-2">BBox (x1,y1,x2,y2)</th>
-                            </tr>
-                          </thead>
-                          <tbody className="text-white/85">
-                            {r.detections.map((d, idx) => (
-                              <tr key={idx} className="border-t border-white/10">
-                                <td className="py-2">
-                                  <div className="font-semibold">{d.name}</div>
-                                  <div className="text-xs text-white/50">#{d.cls}</div>
-                                </td>
-                                <td className="py-2">{d.conf}</td>
-                                <td className="py-2 text-xs text-white/70">
-                                  [{d.bbox.join(", ")}]
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* original url (optional) */}
-                  {r?.original_image_url && (
-                    <div className="text-xs text-white/40">
-                      원본 URL: <span className="text-white/60">{joinUrl(r.original_image_url)}</span>
-                    </div>
-                  )}
+                <div className="mt-6 text-xs text-black/50">
+                  * 백엔드는 <span className="text-black/70">body_assembly/samples</span> 폴더의 이미지를
+                  순차 사용합니다. (5초마다 배치 자동 요청)
                 </div>
               </div>
-            );
-          })}
-        </div>
-
-        {/* Footer hint */}
-        <div className="mt-6 text-xs text-white/40">
-          * 배치 분석은 업로드된 부품들만 처리합니다. (없는 파일은 null로 반환)
+            </div>
+          </div>
         </div>
       </div>
     </div>
   );
 }
+
+export default BodyAssemblyDashboard;

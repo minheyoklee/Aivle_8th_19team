@@ -5,6 +5,8 @@ from typing import Dict, Any, List, Optional
 import cv2
 from ultralytics import YOLO
 
+import glob
+
 MODELS: Dict[str, YOLO] = {}
 CFG: Dict[str, Any] = {
     "LOADED": False,
@@ -142,3 +144,66 @@ def save_annotated_image(annotated_bgr, base_dir: str, filename_prefix: str = "b
     out_path = os.path.join(save_dir, out_name)
     cv2.imwrite(out_path, annotated_bgr)
     return out_path
+
+AUTO_STATE: Dict[str, Any] = {
+    "INDEX": {  # part별 다음 인덱스
+        "door": 0,
+        "bumper": 0,
+        "headlamp": 0,
+        "taillamp": 0,
+        "radiator": 0,
+    }
+}
+
+def _list_sample_images(base_dir: str, part: str) -> List[str]:
+    """
+    ml-service/body_assembly/samples/{part}/*.jpg|png...
+    """
+    sample_dir = os.path.join(base_dir, "body_assembly", "samples", part)
+    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp")
+    paths: List[str] = []
+    for ext in exts:
+        paths.extend(glob.glob(os.path.join(sample_dir, ext)))
+    paths = sorted(paths)
+    return paths
+
+
+def predict_part_auto(
+    part: str,
+    base_dir: str,
+    conf: float = 0.25,
+    iou: float = 0.45,
+    max_det: int = 100,
+) -> Dict[str, Any]:
+    """
+    samples 폴더에서 part별 이미지를 순차로 꺼내서 predict_part 수행
+    return에 source/sequence/original_image_path 포함
+    """
+    part = part.strip().lower()
+    if part not in ALLOWED_PARTS:
+        raise ValueError(f"part must be one of {sorted(ALLOWED_PARTS)}")
+
+    if not CFG["LOADED"] or part not in MODELS:
+        raise RuntimeError("Body models not loaded")
+
+    sample_paths = _list_sample_images(base_dir, part)
+    if not sample_paths:
+        raise FileNotFoundError(
+            f"[body_assembly] no sample images: {os.path.join(base_dir, 'body_assembly', 'samples', part)}"
+        )
+
+    idx = int(AUTO_STATE["INDEX"].get(part, 0))
+    if idx >= len(sample_paths):
+        idx = 0
+
+    chosen_path = sample_paths[idx]
+    AUTO_STATE["INDEX"][part] = idx + 1  # 다음 호출 대비
+
+    with open(chosen_path, "rb") as f:
+        image_bytes = f.read()
+
+    pred = predict_part(part, image_bytes, conf=conf, iou=iou, max_det=max_det)
+    pred["source"] = chosen_path
+    pred["sequence"] = {"index_next": AUTO_STATE["INDEX"][part], "count": len(sample_paths)}
+    pred["original_image_path"] = chosen_path
+    return pred
